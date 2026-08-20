@@ -1905,6 +1905,161 @@ spec:
 			framework.ExpectNoError(err, "27. Check connectivity from pod to an external \"node\" and verify that the IP is the egress IP, failed, err: %v", err)
 		})
 
+		/* This test does the following:
+		   0. Add the "k8s.ovn.org/egress-assignable" label to one node
+		   1. Create an EgressIP object requesting an egress IP and wait for assignment
+		   2. Repeat rapid delete/create races: delete without waiting for controller cleanup,
+		      immediately create the alternate EgressIP name, then verify assignment succeeds
+		   3. Rapidly create and delete EgressIP objects without waiting for assignment status,
+		      to simulate empty-status deletions during churn
+		   4. Restart ovnkube-control-plane pods to simulate controller restart with potential
+		      cache/status desync
+		   5. Create an EgressIP object that legitimately owns the egress IP
+		   6. Create a second, conflicting EgressIP object requesting the same egress IP
+		   7. Check that the conflicting EgressIP object is never assigned while the first
+		      one still owns the IP
+		   8. Check that the first EgressIP object retains its original assignment
+		*/
+		ginkgo.It("Should reassign a stale egress IP allocation after rapid EgressIP delete/create cycles, while preserving genuine conflicts", func() {
+			const (
+				controlPlanePodName   = "ovnkube-control-plane"
+				raceCycles            = 30
+				rapidNoWaitCycles     = 10
+			)
+
+			ginkgo.By("0. Add the \"k8s.ovn.org/egress-assignable\" label to one node")
+			e2enode.AddOrUpdateLabelOnNode(f.ClientSet, egress1Node.name, "k8s.ovn.org/egress-assignable", "dummy")
+
+			var egressIP net.IP
+			var err error
+			if isIPv6TestRun {
+				egressIP, err = ipalloc.NewPrimaryIPv6()
+			} else {
+				egressIP, err = ipalloc.NewPrimaryIPv4()
+			}
+			gomega.Expect(err).ShouldNot(gomega.HaveOccurred(), "must allocate new Node IP")
+
+			namespaceLabel := map[string]string{"name": f.Namespace.Name}
+			names := []string{egressIPName, egressIPName2}
+
+			defer func() {
+				if err := os.Remove(egressIPYaml); err != nil {
+					framework.Logf("Unable to remove the CRD config from disk: %v", err)
+				}
+			}()
+
+			writeEgressIPManifest := func(name string) {
+				egressIPConfig := createEIPManifest(name, podEgressLabel, namespaceLabel, egressIP.String())
+				if err := os.WriteFile(egressIPYaml, []byte(egressIPConfig), 0644); err != nil {
+					framework.Failf("Unable to write CRD config to disk: %v", err)
+				}
+			}
+
+			createEgressIP := func(name string) {
+				writeEgressIPManifest(name)
+				e2ekubectl.RunKubectlOrDie("default", "create", "-f", egressIPYaml)
+			}
+
+			deleteEgressIPNoWait := func(name string) {
+				e2ekubectl.RunKubectlOrDie("default", "delete", "eip", name, "--ignore-not-found=true", "--wait=false")
+			}
+
+			waitForEgressIPAbsent := func(name string) {
+				err := wait.PollImmediate(retryInterval, retryTimeout, func() (bool, error) {
+					_, err := e2ekubectl.RunKubectl("default", "get", "eip", name)
+					return err != nil, nil
+				})
+				if err != nil {
+					framework.Failf("Error: expected EgressIP %q to be deleted, but it still exists: %v", name, err)
+				}
+			}
+
+			restartOvnKubeControlPlane := func() {
+				ovnKubeNamespace := deploymentconfig.Get().OVNKubernetesNamespace()
+				podList, err := f.ClientSet.CoreV1().Pods(ovnKubeNamespace).List(context.Background(), metav1.ListOptions{
+					LabelSelector: "name=" + controlPlanePodName,
+				})
+				framework.ExpectNoError(err)
+				numControlPlanePods := len(podList.Items)
+				for _, controlPlanePod := range podList.Items {
+					ginkgo.By("Restarting ovnkube control plane pod " + controlPlanePod.Name)
+					framework.ExpectNoError(deletePodWithWaitByName(context.Background(), f.ClientSet, controlPlanePod.Name, ovnKubeNamespace))
+				}
+				framework.ExpectNoError(waitClusterHealthy(f, numControlPlanePods, controlPlanePodName))
+			}
+
+			createAndWaitForAssignment := func(name string) []egressIPStatus {
+				createEgressIP(name)
+				return verifySpecificEgressIPStatusLengthEquals(name, 1, nil)
+			}
+
+			ginkgo.By(fmt.Sprintf("1. Create initial EgressIP %q requesting IP %s and wait for assignment", egressIPName, egressIP.String()))
+			statuses := createAndWaitForAssignment(egressIPName)
+			gomega.Expect(statuses[0].EgressIP).To(gomega.Equal(egressIP.String()))
+			gomega.Expect(statuses[0].Node).To(gomega.Equal(egress1Node.name))
+
+			ginkgo.By(fmt.Sprintf("2. Repeat %d delete/create races without waiting for controller cleanup before recreating the alternate EgressIP", raceCycles))
+			for i := 0; i < raceCycles; i++ {
+				nameToDelete := names[i%2]
+				nameToCreate := names[(i+1)%2]
+
+				ginkgo.By(fmt.Sprintf("2a. Delete EgressIP %q without waiting for controller cleanup (race cycle %d)", nameToDelete, i))
+				deleteEgressIPNoWait(nameToDelete)
+
+				ginkgo.By(fmt.Sprintf("2b. Immediately create EgressIP %q with IP %s (race cycle %d)", nameToCreate, egressIP.String(), i))
+				createEgressIP(nameToCreate)
+
+				ginkgo.By(fmt.Sprintf("2c. Verify EgressIP %q is assigned after stale-cache race (cycle %d)", nameToCreate, i))
+				statuses = verifySpecificEgressIPStatusLengthEquals(nameToCreate, 1, nil)
+				gomega.Expect(statuses[0].EgressIP).To(gomega.Equal(egressIP.String()))
+				gomega.Expect(statuses[0].Node).To(gomega.Equal(egress1Node.name))
+			}
+
+			ginkgo.By(fmt.Sprintf("3. Rapidly create and delete EgressIP objects requesting IP %s %d times without waiting for assignment status", egressIP.String(), rapidNoWaitCycles))
+			for i := 0; i < rapidNoWaitCycles; i++ {
+				name := names[i%2]
+				writeEgressIPManifest(name)
+				_, err := e2ekubectl.RunKubectl("default", "create", "-f", egressIPYaml)
+				if err != nil {
+					framework.Logf("Create EgressIP %q returned err (may already exist during rapid churn): %v", name, err)
+				}
+				deleteEgressIPNoWait(name)
+			}
+
+			ginkgo.By("3b. Ensure no EgressIP objects remain before controller restart")
+			for _, name := range names {
+				deleteEgressIPNoWait(name)
+			}
+			for _, name := range names {
+				waitForEgressIPAbsent(name)
+			}
+
+			ginkgo.By("4. Restart ovnkube-control-plane to simulate controller restart with potential cache/status desync")
+			restartOvnKubeControlPlane()
+
+			ginkgo.By(fmt.Sprintf("5. Create EgressIP %q which legitimately owns IP %s", egressIPName, egressIP.String()))
+			ownerStatuses := createAndWaitForAssignment(egressIPName)
+			gomega.Expect(ownerStatuses[0].EgressIP).To(gomega.Equal(egressIP.String()))
+
+			ginkgo.By(fmt.Sprintf("6. Create a second, conflicting EgressIP %q requesting the same IP %s", egressIPName2, egressIP.String()))
+			conflictConfig := createEIPManifest(egressIPName2, podEgressLabel, namespaceLabel, egressIP.String())
+			if err := os.WriteFile(egressIPYaml, []byte(conflictConfig), 0644); err != nil {
+				framework.Failf("Unable to write CRD config to disk: %v", err)
+			}
+			e2ekubectl.RunKubectlOrDie("default", "create", "-f", egressIPYaml)
+
+			ginkgo.By(fmt.Sprintf("7. Check that the conflicting EgressIP %q is never assigned while %q still owns the IP", egressIPName2, egressIPName))
+			gomega.Consistently(func() int {
+				return len(getSpecificEgressIPStatusItems(egressIPName2))
+			}, "5s", "1s").Should(gomega.Equal(0))
+
+			ginkgo.By(fmt.Sprintf("8. Check that %q retains its original assignment", egressIPName))
+			finalOwnerStatuses := getSpecificEgressIPStatusItems(egressIPName)
+			gomega.Expect(finalOwnerStatuses).To(gomega.HaveLen(1))
+			gomega.Expect(finalOwnerStatuses[0].EgressIP).To(gomega.Equal(egressIP.String()))
+			gomega.Expect(finalOwnerStatuses[0].Node).To(gomega.Equal(egress1Node.name))
+		})
+
 		// Validate the egress IP works with egress firewall by creating two httpd
 		// containers on the kind networking (effectively seen as "outside" the cluster)
 		// and curl them from a pod in the cluster which matches the egress IP stanza.
